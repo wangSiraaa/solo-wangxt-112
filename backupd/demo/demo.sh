@@ -44,6 +44,13 @@ SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 for i in $(seq 1 50); do curl -sf "$BASE/v1/healthz" > /dev/null && break || sleep 0.1; done
 
+restart_server() {
+  kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true
+  "$BIN" -addr "$ADDR" -data "$DATA" -enable-fault-injection >> "$DEMO/server.log" 2>&1 &
+  SRV=$!
+  for i in $(seq 1 50); do curl -sf "$BASE/v1/healthz" > /dev/null && break || sleep 0.1; done
+}
+
 # ---------------------------------------------------------------- snapshot 1
 say "快照 1：基线"
 post /v1/snapshots "{\"source_root\": \"$SRC\"}" | tee "$DEMO/snap1.json" | jq '{id,status,file_count,dir_count,symlink_count,total_bytes,chunks_added,chunks_reused}'
@@ -112,33 +119,59 @@ say "保留策略：dry-run 预览（保留最近 1 个 complete 快照），不
 SNAPS_BEFORE=$(curl -sS "$BASE/v1/snapshots" | jq length)
 CHUNKS_BEFORE=$(find "$DATA/chunks" -type f -not -name '.tmp-*' | wc -l)
 post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1, \"dry_run\": true}" \
-  | jq '{dry_run, applied, delete_snapshots, kept: [.kept_snapshots[] | {id,status}], reclaim_chunks, reclaim_bytes}'
+  | jq '{dry_run, applied, pending_snapshots, kept: [.kept_snapshots[] | {id,status}], reclaim_chunks, reclaim_bytes}'
 test "$(curl -sS "$BASE/v1/snapshots" | jq length)" = "$SNAPS_BEFORE" && echo "DRYRUN_OK: 快照清单未变"
 test "$(find "$DATA/chunks" -type f -not -name '.tmp-*' | wc -l)" = "$CHUNKS_BEFORE" && echo "DRYRUN_OK: 块目录未变"
 
-say "应用保留策略：删除旧 complete 快照，仅回收零引用块（共享块保留）"
-post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1}" \
-  | jq '{applied, delete_snapshots, reclaim_chunks, reclaim_bytes, warnings}'
+say "应用保留：创建清理批次 purge-0001（撤销窗口 3600 秒），超期快照置为待清理而非删除"
+post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1, \"purge_id\": \"purge-0001\", \"window_seconds\": 3600, \"operator\": \"demo\"}" \
+  | jq '{applied, purge_id, execute_after, pending_snapshots}'
+test "$(curl -sS "$BASE/v1/snapshots/1" | jq -r .status)" = "pending_purge" && echo "PURGE_OK: 快照 1 先待清理，未被删除"
+test -n "$(curl -sS "$BASE/v1/snapshots/1/files" | jq -r '.[0].path')" && echo "PURGE_OK: 待清理快照清单完整"
+
+say "同一 purge_id 重复提交：幂等回放，不产生新批次"
+post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1, \"purge_id\": \"purge-0001\", \"window_seconds\": 3600}" \
+  | jq '{replayed, pending_snapshots}'
+test "$(curl -sS "$BASE/v1/purges" | jq length)" = "1" && echo "PURGE_OK: 批次唯一"
+
+say "重启服务：批次、待清理状态与审计记录持久可查"
+restart_server
+curl -sS "$BASE/v1/purges/purge-0001" \
+  | jq '{batch: .batch | {purge_id, status, execute_after}, items: [.items[] | {snapshot_id, state}], audit: [.audit[] | .action]}'
+
+say "窗口内撤销快照 1：回到 complete，清单未被重写，可完整恢复"
+post "/v1/purges/purge-0001/undo" '{"snapshot_id": 1}' | jq '{batch_status, undone_snapshots}'
+test "$(curl -sS "$BASE/v1/snapshots/1" | jq -r .status)" = "complete" && echo "UNDO_OK: 快照 1 恢复为 complete"
+post /v1/restore "{\"snapshot_id\": 1, \"target_dir\": \"$DEMO/restore-undone\"}" | jq '{status, restored, failed}'
+test "$(wc -l < "$DEMO/restore-undone/docs/report.txt")" = "4000" && echo "UNDO_OK: 撤销后快照可完整恢复（内容未变）"
+
+say "窗口未到期执行清理：拒绝"
+post "/v1/purges/purge-0001/execute" '{}' | jq .
+
+say "整批撤销 purge-0001：批次取消"
+post "/v1/purges/purge-0001/undo" '{"all": true}' | jq '{batch_status, undone_snapshots}'
+
+say "再次应用保留（purge-0002，窗口 0 秒）并到期执行清理：只回收零引用块"
+post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1, \"purge_id\": \"purge-0002\", \"window_seconds\": 0}" \
+  | jq '{applied, pending_snapshots}'
+post "/v1/purges/purge-0002/execute" '{}' | jq '{status, purged_snapshots, reclaim_chunks, reclaim_bytes, warnings}'
+curl -sS "$BASE/v1/snapshots/1" | jq .
 echo "块目录：$CHUNKS_BEFORE -> $(find "$DATA/chunks" -type f -not -name '.tmp-*' | wc -l) 块"
-curl -sS "$BASE/v1/snapshots" | jq '.[] | {id,status}'
 
-say "删除后：保留的快照 2 仍可完整恢复（共享块与空文件不受影响）"
-post /v1/restore "{\"snapshot_id\": 2, \"target_dir\": \"$DEMO/restore-after-retention\"}" | jq '{status, restored, failed}'
-diff -r --no-dereference --exclude=active.log --exclude=late.bin --exclude=escape-hatch "$SRC" "$DEMO/restore-after-retention" \
-  && echo "RETENTION_OK: 保留快照恢复内容一致"
-test -f "$DEMO/restore-after-retention/empty.txt" && echo "RETENTION_OK: 空文件恢复正常"
+say "清理后：保留的快照 2 仍可完整恢复（共享块与空文件不受影响）"
+post /v1/restore "{\"snapshot_id\": 2, \"target_dir\": \"$DEMO/restore-after-purge\"}" | jq '{status, restored, failed}'
+diff -r --no-dereference --exclude=active.log --exclude=late.bin --exclude=escape-hatch "$SRC" "$DEMO/restore-after-purge" \
+  && echo "PURGE_OK: 保留快照恢复内容一致"
+test -f "$DEMO/restore-after-purge/empty.txt" && echo "PURGE_OK: 空文件恢复正常"
 
-say "再次执行同一策略：删除集为空、回收为零，结果稳定"
-post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1}" | jq '{delete_snapshots, reclaim_chunks, reclaim_bytes}'
+say "重复执行 purge-0002：幂等稳定，无二次删除"
+post "/v1/purges/purge-0002/execute" '{}' | jq '{status, replayed, purged_snapshots, reclaim_chunks}'
 
 say "修复流程：对 failed 快照 4 发起修复，模拟修复中途崩溃（fault_after_chunks=2）"
 post "/v1/snapshots/4/repair" '{"repair_id": "repair-0001", "fault_after_chunks": 2}' | jq . || true
 
 say "重启服务（模拟进程中断），持久化的尝试记录仍在"
-kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true
-"$BIN" -addr "$ADDR" -data "$DATA" -enable-fault-injection >> "$DEMO/server.log" 2>&1 &
-SRV=$!
-for i in $(seq 1 50); do curl -sf "$BASE/v1/healthz" > /dev/null && break || sleep 0.1; done
+restart_server
 curl -sS "$BASE/v1/snapshots/4/repairs" | jq '.[] | {repair_id, status, attempts}'
 curl -sS "$BASE/v1/snapshots/4/repairs/repair-0001" | jq '{repair_id, status, attempts}'
 

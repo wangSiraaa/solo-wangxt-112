@@ -13,10 +13,25 @@ import (
 
 // Snapshot lifecycle states.
 const (
-	StatusRunning    = "running"
-	StatusComplete   = "complete"
-	StatusIncomplete = "incomplete" // finished, but some files were unstable mid-scan
-	StatusFailed     = "failed"     // scan/commit error or chunks missing from store
+	StatusRunning      = "running"
+	StatusComplete     = "complete"
+	StatusIncomplete   = "incomplete"    // finished, but some files were unstable mid-scan
+	StatusFailed       = "failed"        // scan/commit error or chunks missing from store
+	StatusPendingPurge = "pending_purge" // slated for deletion, still undoable
+)
+
+// Purge batch states.
+const (
+	PurgeOpen      = "open"
+	PurgeExecuted  = "executed"
+	PurgeCancelled = "cancelled"
+)
+
+// Purge item states.
+const (
+	PurgeItemPending = "pending"
+	PurgeItemUndone  = "undone"
+	PurgeItemPurged  = "purged"
 )
 
 // File entry states.
@@ -94,7 +109,53 @@ func Open(path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
+	if err := db.migrateRepairAttemptsFK(); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+// migrateRepairAttemptsFK rebuilds repair_attempts on databases created
+// before the snapshots foreign key was dropped: repair records are historical
+// and must outlive the snapshots they refer to (purge deletes snapshots).
+func (db *DB) migrateRepairAttemptsFK() error {
+	var ddl string
+	err := db.sql.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='repair_attempts'`).Scan(&ddl)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(ddl, "REFERENCES snapshots") {
+		return nil // already migrated
+	}
+	stmts := []string{
+		`ALTER TABLE repair_attempts RENAME TO repair_attempts_old`,
+		`CREATE TABLE repair_attempts (
+		  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		  repair_id       TEXT NOT NULL,
+		  snapshot_id     INTEGER NOT NULL,
+		  started_at      TEXT NOT NULL,
+		  finished_at     TEXT NOT NULL DEFAULT '',
+		  status          TEXT NOT NULL,
+		  error           TEXT NOT NULL DEFAULT '',
+		  attempts        INTEGER NOT NULL DEFAULT 1,
+		  chunks_supplied INTEGER NOT NULL DEFAULT 0,
+		  bytes_supplied  INTEGER NOT NULL DEFAULT 0,
+		  UNIQUE (snapshot_id, repair_id)
+		)`,
+		`INSERT INTO repair_attempts SELECT id, repair_id, snapshot_id, started_at, finished_at,
+		  status, error, attempts, chunks_supplied, bytes_supplied FROM repair_attempts_old`,
+		`DROP TABLE repair_attempts_old`,
+	}
+	for _, q := range stmts {
+		if _, err := db.sql.Exec(q); err != nil {
+			return fmt.Errorf("migrate repair_attempts: %w", err)
+		}
+	}
+	return nil
 }
 
 func (db *DB) Close() error { return db.sql.Close() }
@@ -153,7 +214,7 @@ CREATE INDEX IF NOT EXISTS idx_missing_snap ON missing_chunks(snapshot_id);
 CREATE TABLE IF NOT EXISTS repair_attempts (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   repair_id       TEXT NOT NULL,
-  snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id),
+  snapshot_id     INTEGER NOT NULL,
   started_at      TEXT NOT NULL,
   finished_at     TEXT NOT NULL DEFAULT '',
   status          TEXT NOT NULL,
@@ -164,6 +225,33 @@ CREATE TABLE IF NOT EXISTS repair_attempts (
   UNIQUE (snapshot_id, repair_id)
 );
 CREATE INDEX IF NOT EXISTS idx_repair_snap ON repair_attempts(snapshot_id);
+CREATE TABLE IF NOT EXISTS purge_batches (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  purge_id           TEXT NOT NULL UNIQUE,
+  source_root        TEXT NOT NULL,
+  keep_last_complete INTEGER NOT NULL,
+  created_at         TEXT NOT NULL,
+  execute_after      TEXT NOT NULL,
+  status             TEXT NOT NULL,
+  executed_at        TEXT NOT NULL DEFAULT '',
+  operator           TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS purge_items (
+  batch_id    INTEGER NOT NULL REFERENCES purge_batches(id),
+  snapshot_id INTEGER NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'pending',
+  undone_at   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (batch_id, snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS purge_audit (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id    INTEGER NOT NULL REFERENCES purge_batches(id),
+  snapshot_id INTEGER NOT NULL DEFAULT 0,
+  action      TEXT NOT NULL,
+  at          TEXT NOT NULL,
+  detail      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_purge_audit_batch ON purge_audit(batch_id);
 `)
 	return err
 }
@@ -358,22 +446,15 @@ func (db *DB) ReclaimableChunks(excludeIDs []int64) ([]ReclaimedChunk, error) {
 	return scanReclaimed(rows)
 }
 
-// DeleteSnapshots removes every manifest row of the given snapshots in a
-// single transaction, then — inside the same transaction — computes the
-// chunk-registry rows left with zero references from the remaining
-// file_chunks and removes them from the registry. The returned list is what
-// the caller may delete from the chunk directory after commit; a failure
-// there leaves harmless orphan files, never an inconsistent manifest.
-func (db *DB) DeleteSnapshots(ids []int64) ([]ReclaimedChunk, error) {
+// deleteSnapshotsAndOrphansTx removes every manifest row of the given
+// snapshots, then computes the chunk-registry rows left with zero references
+// from the remaining file_chunks and removes them from the registry. It runs
+// inside the caller's transaction; the returned chunks may be deleted from
+// the chunk directory after commit.
+func (db *DB) deleteSnapshotsAndOrphansTx(tx *sql.Tx, ids []int64) ([]ReclaimedChunk, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	tx, err := db.sql.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	ph := placeholders(len(ids))
 	args := idsToArgs(ids)
 	stmts := []string{
@@ -387,7 +468,6 @@ func (db *DB) DeleteSnapshots(ids []int64) ([]ReclaimedChunk, error) {
 			return nil, err
 		}
 	}
-
 	rows, err := tx.Query(`SELECT sha256, size FROM chunks c
 		WHERE NOT EXISTS (SELECT 1 FROM file_chunks fc WHERE fc.chunk_sha256 = c.sha256)
 		ORDER BY sha256`)
@@ -401,9 +481,6 @@ func (db *DB) DeleteSnapshots(ids []int64) ([]ReclaimedChunk, error) {
 	}
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE NOT EXISTS
 		(SELECT 1 FROM file_chunks fc WHERE fc.chunk_sha256 = chunks.sha256)`); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return orphans, nil
@@ -571,4 +648,294 @@ func (db *DB) FileChunks(fileID int64) ([]ChunkRef, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// PurgeBatch is one delayed-deletion plan created by a retention apply.
+type PurgeBatch struct {
+	ID               int64  `json:"id"`
+	PurgeID          string `json:"purge_id"`
+	SourceRoot       string `json:"source_root"`
+	KeepLastComplete int    `json:"keep_last_complete"`
+	CreatedAt        string `json:"created_at"`
+	ExecuteAfter     string `json:"execute_after"`
+	Status           string `json:"status"` // open | executed | cancelled
+	ExecutedAt       string `json:"executed_at,omitempty"`
+	Operator         string `json:"operator,omitempty"`
+}
+
+// PurgeItem is one snapshot inside a purge batch.
+type PurgeItem struct {
+	BatchID    int64  `json:"batch_id"`
+	SnapshotID int64  `json:"snapshot_id"`
+	State      string `json:"state"` // pending | undone | purged
+	UndoneAt   string `json:"undone_at,omitempty"`
+}
+
+// PurgeAuditEntry is one audited operation on a batch.
+type PurgeAuditEntry struct {
+	ID         int64  `json:"id"`
+	BatchID    int64  `json:"batch_id"`
+	SnapshotID int64  `json:"snapshot_id,omitempty"`
+	Action     string `json:"action"`
+	At         string `json:"at"`
+	Detail     string `json:"detail,omitempty"`
+}
+
+// CreatePurgeBatch atomically, in one transaction: inserts the batch and its
+// items, flips the selected snapshots complete->pending_purge (guarded per
+// row) and writes the audit entry.
+func (db *DB) CreatePurgeBatch(b PurgeBatch, snapshotIDs []int64) (int64, error) {
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`INSERT INTO purge_batches
+		(purge_id, source_root, keep_last_complete, created_at, execute_after, status, operator)
+		VALUES (?,?,?,?,?,?,?)`,
+		b.PurgeID, b.SourceRoot, b.KeepLastComplete, now(), b.ExecuteAfter, PurgeOpen, b.Operator)
+	if err != nil {
+		return 0, err
+	}
+	batchID, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range snapshotIDs {
+		if _, err := tx.Exec(`INSERT INTO purge_items (batch_id, snapshot_id, state) VALUES (?,?,?)`,
+			batchID, id, PurgeItemPending); err != nil {
+			return 0, err
+		}
+		r, err := tx.Exec(`UPDATE snapshots SET status=? WHERE id=? AND status=?`,
+			StatusPendingPurge, id, StatusComplete)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := r.RowsAffected(); n != 1 {
+			return 0, fmt.Errorf("snapshot %d not in complete state; batch not created", id)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO purge_audit (batch_id, snapshot_id, action, at, detail) VALUES (?,?,?,?,?)`,
+		batchID, 0, "created", now(),
+		fmt.Sprintf("keep_last_complete=%d, %d snapshot(s) pending", b.KeepLastComplete, len(snapshotIDs))); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return batchID, nil
+}
+
+func scanBatch(row interface{ Scan(...any) error }) (*PurgeBatch, error) {
+	var b PurgeBatch
+	err := row.Scan(&b.ID, &b.PurgeID, &b.SourceRoot, &b.KeepLastComplete, &b.CreatedAt,
+		&b.ExecuteAfter, &b.Status, &b.ExecutedAt, &b.Operator)
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+func (db *DB) GetPurgeBatch(purgeID string) (*PurgeBatch, error) {
+	b, err := scanBatch(db.sql.QueryRow(`SELECT id, purge_id, source_root, keep_last_complete,
+		created_at, execute_after, status, executed_at, operator
+		FROM purge_batches WHERE purge_id=?`, purgeID))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return b, err
+}
+
+func (db *DB) ListPurgeBatches() ([]PurgeBatch, error) {
+	rows, err := db.sql.Query(`SELECT id, purge_id, source_root, keep_last_complete,
+		created_at, execute_after, status, executed_at, operator
+		FROM purge_batches ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PurgeBatch{}
+	for rows.Next() {
+		b, err := scanBatch(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *b)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) PurgeItems(batchID int64) ([]PurgeItem, error) {
+	rows, err := db.sql.Query(`SELECT batch_id, snapshot_id, state, undone_at
+		FROM purge_items WHERE batch_id=? ORDER BY snapshot_id`, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PurgeItem{}
+	for rows.Next() {
+		var it PurgeItem
+		if err := rows.Scan(&it.BatchID, &it.SnapshotID, &it.State, &it.UndoneAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) PurgeAudit(batchID int64) ([]PurgeAuditEntry, error) {
+	rows, err := db.sql.Query(`SELECT id, batch_id, snapshot_id, action, at, detail
+		FROM purge_audit WHERE batch_id=? ORDER BY id`, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PurgeAuditEntry{}
+	for rows.Next() {
+		var a PurgeAuditEntry
+		if err := rows.Scan(&a.ID, &a.BatchID, &a.SnapshotID, &a.Action, &a.At, &a.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// SnapshotHasRunningRepair reports whether a snapshot has a repair attempt
+// in flight; such snapshots must never be purged.
+func (db *DB) SnapshotHasRunningRepair(snapshotID int64) (bool, error) {
+	var n int64
+	err := db.sql.QueryRow(`SELECT COUNT(*) FROM repair_attempts WHERE snapshot_id=? AND status=?`,
+		snapshotID, RepairRunning).Scan(&n)
+	return n > 0, err
+}
+
+// UndoPurgeItem flips one pending item back: the snapshot returns to
+// complete (its file/chunk manifest was never touched) and the item is
+// marked undone, in one transaction.
+func (db *DB) UndoPurgeItem(batchID, snapshotID int64) error {
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	r, err := tx.Exec(`UPDATE snapshots SET status=? WHERE id=? AND status=?`,
+		StatusComplete, snapshotID, StatusPendingPurge)
+	if err != nil {
+		return err
+	}
+	if n, _ := r.RowsAffected(); n != 1 {
+		return fmt.Errorf("snapshot %d not in pending_purge state", snapshotID)
+	}
+	r, err = tx.Exec(`UPDATE purge_items SET state=?, undone_at=? WHERE batch_id=? AND snapshot_id=? AND state=?`,
+		PurgeItemUndone, now(), batchID, snapshotID, PurgeItemPending)
+	if err != nil {
+		return err
+	}
+	if n, _ := r.RowsAffected(); n != 1 {
+		return fmt.Errorf("purge item %d not pending in batch %d", snapshotID, batchID)
+	}
+	if _, err := tx.Exec(`INSERT INTO purge_audit (batch_id, snapshot_id, action, at, detail) VALUES (?,?,?,?,?)`,
+		batchID, snapshotID, "undo_snapshot", now(), ""); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UndoPurgeBatch undoes every still-pending item and cancels the batch.
+func (db *DB) UndoPurgeBatch(batchID int64) ([]int64, error) {
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT snapshot_id FROM purge_items WHERE batch_id=? AND state=?`,
+		batchID, PurgeItemPending)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if ids == nil {
+		ids = []int64{}
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE snapshots SET status=? WHERE id=? AND status=?`,
+			StatusComplete, id, StatusPendingPurge); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE purge_items SET state=?, undone_at=? WHERE batch_id=? AND state=?`,
+		PurgeItemUndone, now(), batchID, PurgeItemPending); err != nil {
+		return nil, err
+	}
+	r, err := tx.Exec(`UPDATE purge_batches SET status=? WHERE id=? AND status=?`,
+		PurgeCancelled, batchID, PurgeOpen)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := r.RowsAffected(); n != 1 {
+		return nil, fmt.Errorf("purge batch %d not open", batchID)
+	}
+	if _, err := tx.Exec(`INSERT INTO purge_audit (batch_id, snapshot_id, action, at, detail) VALUES (?,?,?,?,?)`,
+		batchID, 0, "undo_batch", now(), fmt.Sprintf("%d snapshot(s) restored to complete", len(ids))); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// ExecutePurgeBatch atomically, in one transaction: deletes the manifest of
+// the given snapshots (computing zero-reference chunks from all surviving
+// file_chunks), marks their items purged, optionally closes the batch as
+// executed, and writes the audit entry. Chunk files are removed by the
+// caller after commit.
+func (db *DB) ExecutePurgeBatch(batchID int64, ids []int64, markExecuted bool) ([]ReclaimedChunk, error) {
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	orphans, err := db.deleteSnapshotsAndOrphansTx(tx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE purge_items SET state=? WHERE batch_id=? AND snapshot_id=? AND state=?`,
+			PurgeItemPurged, batchID, id, PurgeItemPending); err != nil {
+			return nil, err
+		}
+	}
+	if markExecuted {
+		r, err := tx.Exec(`UPDATE purge_batches SET status=?, executed_at=? WHERE id=? AND status=?`,
+			PurgeExecuted, now(), batchID, PurgeOpen)
+		if err != nil {
+			return nil, err
+		}
+		if n, _ := r.RowsAffected(); n != 1 {
+			return nil, fmt.Errorf("purge batch %d not open", batchID)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO purge_audit (batch_id, snapshot_id, action, at, detail) VALUES (?,?,?,?,?)`,
+		batchID, 0, "executed", now(), fmt.Sprintf("%d snapshot(s) purged", len(ids))); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return orphans, nil
 }

@@ -4,6 +4,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -31,6 +32,10 @@ func New(svc *backup.Service, db *store.DB) *Server {
 	mux.HandleFunc("GET /v1/snapshots/{id}/repairs/{repair_id}", s.getRepair)
 	mux.HandleFunc("POST /v1/restore", s.restore)
 	mux.HandleFunc("POST /v1/retention", s.retention)
+	mux.HandleFunc("GET /v1/purges", s.listPurges)
+	mux.HandleFunc("GET /v1/purges/{purge_id}", s.getPurge)
+	mux.HandleFunc("POST /v1/purges/{purge_id}/undo", s.undoPurge)
+	mux.HandleFunc("POST /v1/purges/{purge_id}/execute", s.executePurge)
 	s.mux = mux
 	return s
 }
@@ -205,6 +210,56 @@ func (s *Server) getRepair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, attempt)
+}
+
+func (s *Server) listPurges(w http.ResponseWriter, _ *http.Request) {
+	batches, err := s.svc.ListPurgeBatches()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, batches)
+}
+
+func (s *Server) getPurge(w http.ResponseWriter, r *http.Request) {
+	detail, err := s.svc.GetPurgeBatch(r.PathValue("purge_id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if detail == nil {
+		writeErr(w, http.StatusNotFound, errors.New("purge batch not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+func (s *Server) undoPurge(w http.ResponseWriter, r *http.Request) {
+	var req backup.UndoPurgeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	rep, err := s.svc.UndoPurge(r.PathValue("purge_id"), req)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (s *Server) executePurge(w http.ResponseWriter, r *http.Request) {
+	var req backup.ExecutePurgeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	rep, err := s.svc.ExecutePurge(r.PathValue("purge_id"), req)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (s *Server) retention(w http.ResponseWriter, r *http.Request) {

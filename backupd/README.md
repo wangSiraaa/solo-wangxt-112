@@ -13,7 +13,7 @@ internal/store         SQLite 清单（modernc.org/sqlite，纯 Go，无 cgo）
 ```
 
 - 分块：`github.com/restic/chunker`，固定多项式 `0x3DA3358B4DC173`，min 2 KiB / avg 16 KiB / max 64 KiB。多项式固定 ⇒ 块边界跨快照、跨重启确定，小改动只产生少量新块。
-- 清单表：`snapshots` / `files` / `chunks` / `file_chunks` / `missing_chunks`。
+- 清单表：`snapshots` / `files` / `chunks` / `file_chunks` / `missing_chunks` / `repair_attempts` / `purge_batches` / `purge_items` / `purge_audit`。
 
 ## 运行
 
@@ -38,7 +38,11 @@ go build -o bin/backupd ./cmd/backupd
 | GET | `/v1/snapshots/{id}/repairs` | 该快照的修复尝试记录 |
 | GET | `/v1/snapshots/{id}/repairs/{repair_id}` | 单次修复尝试记录 |
 | POST | `/v1/restore` | `{snapshot_id, target_dir, allow_incomplete?}` 恢复 |
-| POST | `/v1/retention` | `{source_root, keep_last_complete, dry_run?}` 保留策略预览/应用 |
+| POST | `/v1/retention` | `{source_root, keep_last_complete, dry_run?, purge_id?, window_seconds?, operator?}` 保留预览/创建清理批次 |
+| GET | `/v1/purges` | 清理批次列表 |
+| GET | `/v1/purges/{purge_id}` | 批次详情（计划、快照项、审计流水） |
+| POST | `/v1/purges/{purge_id}/undo` | `{snapshot_id}` 撤销单个 / `{all:true}` 整批撤销 |
+| POST | `/v1/purges/{purge_id}/execute` | `{force?}` 到期执行清理 |
 
 ## 修复（repair）
 
@@ -49,20 +53,22 @@ go build -o bin/backupd ./cmd/backupd
 3. **原子转正**：全部引用重新校验通过后，在**单个 SQLite 事务**内完成 `failed → complete`、清理 `missing_chunks`、记录尝试成功；事务失败整体回滚。
 4. **幂等与断点续修**：`repair_id` 为幂等键，尝试记录持久化于 `repair_attempts` 表。已成功的 `(snapshot_id, repair_id)` 重复请求直接回放结果（`replayed: true`），不重写清单；崩溃/中断留下的 `running` 记录在重启后用同一 `repair_id` 重试即可安全续跑（已写入的块按内容寻址天然幂等）。
 
-## 保留策略（retention）
+## 延迟清理与撤销（retention + delayed purge）
 
-按 `source_root` 执行「保留最近 N 个 `complete` 快照」：
+按 `source_root` 执行「保留最近 N 个 `complete` 快照」，但应用不再直接删除，而是留出可撤销窗口：
 
-- **预览**：`dry_run: true` 只读计算，返回将删除的快照、保留的快照（含 `failed`/`incomplete` 及其保留原因）、待回收块数与字节数，不修改任何数据。
-- **应用**：`dry_run` 缺省/false 时执行。先在**单个 SQLite 事务**内删除目标快照的全部清单行，并在同事务内基于仍保留快照的 `file_chunks` 引用清掉零引用块注册行；**提交之后**才从块目录删除这些零引用块。共享块被任一保留快照引用即安全；空文件无块，天然不受影响。
-- **失败语义**：清单事务失败则整体回滚，无任何变化；块文件删除失败只留无害孤儿文件（记入报告 `warnings`），绝不会出现清单已删却仍引用已删数据的半状态。
-- **可重复执行**：同一策略再次应用返回空删除集与零回收；`failed`/`incomplete`/`running` 快照永远不在删除范围内。
+- **预览**：`dry_run: true` 只读计算将待清理的快照、保留快照（含原因）、预计可回收块数与字节数，不修改任何数据。
+- **应用（创建批次）**：需提供幂等键 `purge_id` 与撤销窗口 `window_seconds`。超期 `complete` 快照在单个事务内被置为 `pending_purge` 并登记为批次快照项，同时记录策略参数、计划执行时间 `execute_after`、操作者与审计流水。**清单与块此刻零删除**。同一 `purge_id` 重复提交返回已存批次（`replayed`），参数不同则冲突；服务重启后批次可继续查询与执行。
+- **撤销（窗口内）**：`undo` 按快照或整批撤销。快照仅状态列从 `pending_purge` 翻回 `complete`——文件/块清单从未被触碰，立即可完整恢复。整批撤销后批次为 `cancelled`，不可再执行。
+- **执行（到期后）**：`execute` 默认要求窗口到期（`force` 可人工覆盖）。执行时逐项重新校验：状态已变化（被撤销/被保护）或 **repair 进行中**的快照跳过并报告，批次保持 `open` 可再次执行；`failed`/`incomplete`/`running` 永远不会进入批次。清单删除与零引用块计算（基于所有未真正删除快照的 `file_chunks`）在**单个事务**内提交，之后**才**删除块文件；块文件删除失败只留无害孤儿块（记入 `warnings`），绝不会出现清单仍引用已删块的状态。重复执行为幂等回放。
+- **迁移**：旧库打开时自动建齐 `purge_batches`/`purge_items`/`purge_audit` 三表；早期 `repair_attempts` 的 `REFERENCES snapshots` 外键自动重建移除（修复与清理记录是历史数据，必须比快照活得更久）。
 
 ## 快照状态机
 
 - `complete`：扫描无误，且清单引用的每个块都通过 `Verify`（读盘重算 SHA-256）。
 - `incomplete`：有文件在读取期间被修改（mtime/size 在重读 3 次后仍不稳定），该文件标记 `unstable`，内容保留最后一次读取结果。
 - `failed`：扫描出错，或验证发现引用的块不在块存储中；缺块逐条写入 `missing_chunks` 表。
+- `pending_purge`：保留策略已将其列入清理批次，等待窗口到期执行；清单完整，可撤销回 `complete`。
 
 ## 安全与一致性保证
 
@@ -83,6 +89,7 @@ go build -o bin/backupd ./cmd/backupd
 覆盖：基线快照 → 小改动复用旧块（22 块只新增 1 块）→ 空文件 → 扫描中写入的文件标 `unstable` →
 `fault_after_chunks=3` 模拟提交中断得到 `failed` 快照与具体缺块清单 → 恢复到新目录并
 `diff -r` 独立核对 → 重复恢复全部 `skipped_exists` → 符号链接目标根被拒 → 失败快照拒绝/强制恢复 →
-保留策略 dry-run 预览（零副作用）→ 应用后旧 `complete` 快照删除、零引用块回收、保留快照仍可恢复 → 再次执行结果稳定 →
-修复中途崩溃 + 重启后同一 `repair_id` 续修成功、快照原子转 `complete`、幂等回放 → 修复后完整恢复 →
+保留 dry-run 零副作用 → 创建清理批次（快照先 `pending_purge`）→ 同 `purge_id` 幂等回放 → 重启后批次/审计可查 →
+窗口内撤销并完整恢复 → 窗口未到期执行被拒 → 整批撤销 → 到期执行只回收零引用块、共享块与空文件不受影响 →
+重复执行幂等 → 修复中途崩溃 + 重启后同一 `repair_id` 续修成功、快照原子转 `complete` →
 源文件被改写/删除时修复逐项报告且数据库不变。

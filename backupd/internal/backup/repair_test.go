@@ -242,13 +242,17 @@ func TestRepairThenRetentionSharedChunks(t *testing.T) {
 		t.Fatalf("snapB = %s after repair", s.Status)
 	}
 
-	// Retention expires the older complete snapshot A; B stays.
-	rep, err := svc.Retention(RetentionRequest{SourceRoot: src, KeepLastComplete: 1})
+	// Retention expires the older complete snapshot A; B stays. Apply only
+	// creates the purge batch; the explicit execute does the deletion.
+	rep, err := svc.Retention(RetentionRequest{SourceRoot: src, KeepLastComplete: 1, PurgeID: "p1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.DeleteSnapshots) != 1 || rep.DeleteSnapshots[0] != snapA.ID {
+	if len(rep.PendingSnapshots) != 1 || rep.PendingSnapshots[0] != snapA.ID {
 		t.Fatalf("retention report = %+v", rep)
+	}
+	if _, err := svc.ExecutePurge("p1", ExecutePurgeRequest{}); err != nil {
+		t.Fatalf("execute purge: %v", err)
 	}
 
 	// B still restores both the repaired file and the shared file.

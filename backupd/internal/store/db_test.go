@@ -55,6 +55,21 @@ CREATE TABLE missing_chunks (
 );
 INSERT INTO snapshots (source_root, started_at, status) VALUES ('/old/root', '2026-01-01T00:00:00Z', 'failed');
 INSERT INTO missing_chunks (snapshot_id, file_path, chunk_sha256, reason) VALUES (1, 'a.bin', 'deadbeef', 'chunk not in store');
+CREATE TABLE repair_attempts (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  repair_id       TEXT NOT NULL,
+  snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id),
+  started_at      TEXT NOT NULL,
+  finished_at     TEXT NOT NULL DEFAULT '',
+  status          TEXT NOT NULL,
+  error           TEXT NOT NULL DEFAULT '',
+  attempts        INTEGER NOT NULL DEFAULT 1,
+  chunks_supplied INTEGER NOT NULL DEFAULT 0,
+  bytes_supplied  INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (snapshot_id, repair_id)
+);
+INSERT INTO repair_attempts (repair_id, snapshot_id, started_at, status)
+  VALUES ('r-old', 1, '2026-01-02T00:00:00Z', 'failed');
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -96,5 +111,37 @@ INSERT INTO missing_chunks (snapshot_id, file_path, chunk_sha256, reason) VALUES
 	}
 	if attempt.Status != RepairFailed || attempt.Error != "check" {
 		t.Fatalf("attempt = %+v", attempt)
+	}
+
+	// The pre-migration attempt (written while the table still had the
+	// snapshots foreign key) survived the rebuild.
+	old, err := db.GetRepairAttempt(1, "r-old")
+	if err != nil || old == nil {
+		t.Fatalf("pre-migration attempt lost: %v %v", old, err)
+	}
+
+	// The rebuilt table no longer references snapshots: purging the
+	// snapshot must not be blocked and must keep the repair history.
+	if _, err := db.sql.Exec(`DELETE FROM missing_chunks WHERE snapshot_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.Exec(`DELETE FROM snapshots WHERE id=1`); err != nil {
+		t.Fatalf("snapshot delete blocked by FK (migration incomplete): %v", err)
+	}
+	if a, _ := db.GetRepairAttempt(1, "r-old"); a == nil {
+		t.Fatal("repair history deleted with snapshot")
+	}
+
+	// Purge tables migrated and usable.
+	batchID, err := db.CreatePurgeBatch(PurgeBatch{
+		PurgeID: "p-migration", SourceRoot: "/old/root", KeepLastComplete: 1,
+		ExecuteAfter: "2026-01-03T00:00:00Z",
+	}, nil)
+	if err != nil {
+		t.Fatalf("purge_batches not migrated: %v", err)
+	}
+	batch, err := db.GetPurgeBatch("p-migration")
+	if err != nil || batch == nil || batch.ID != batchID {
+		t.Fatalf("batch not persisted: %v %v", batch, err)
 	}
 }
