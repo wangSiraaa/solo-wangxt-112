@@ -1,0 +1,25 @@
+# Local build and runtime output
+backupd/bin/
+backupd/backup-data/
+backupd/*.db
+backupd/*.db-shm
+backupd/*.db-wal
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+credentials.yaml
+credentials.yml
+token.json
+connection.local.*
+
+# Toolchains and caches created outside the delivered application
+gocache/
+gopath/
+tools/
