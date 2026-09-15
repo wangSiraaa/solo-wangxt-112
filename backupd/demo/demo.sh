@@ -95,6 +95,13 @@ test ! -s "$RESTORE/empty.txt" && test -f "$RESTORE/empty.txt" && echo "EMPTY_OK
 say "再次恢复到同一目录：已有文件一律 skipped_exists，绝不覆盖"
 post /v1/restore "{\"snapshot_id\": 2, \"target_dir\": \"$RESTORE\"}" | jq '{status, restored, skipped, failed}'
 
+say "目标根目录本身是指向外部的符号链接：拒绝恢复，外部目录不得出现新文件"
+mkdir -p "$DEMO/external"
+ln -s "$DEMO/external" "$DEMO/restore-link"
+post /v1/restore "{\"snapshot_id\": 2, \"target_dir\": \"$DEMO/restore-link\"}" | jq .
+test -z "$(ls -A "$DEMO/external")" && echo "ROOTLINK_OK: 外部目录无新文件"
+test -L "$DEMO/restore-link" && echo "ROOTLINK_OK: 符号链接未被替换为真实目录"
+
 say "恢复失败的快照 4：默认拒绝"
 post /v1/restore "{\"snapshot_id\": 4, \"target_dir\": \"$DEMO/restore-failed\"}" | jq .
 say "强制恢复（allow_incomplete）：缺块的文件逐个报 failed，而不是静默缺一段"

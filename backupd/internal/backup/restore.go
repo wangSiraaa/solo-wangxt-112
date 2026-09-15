@@ -63,7 +63,7 @@ func (s *Service) Restore(req RestoreRequest) (*RestoreReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bad target_dir: %w", err)
 	}
-	if err := os.MkdirAll(target, 0o755); err != nil {
+	if err := ensureRealDir(target); err != nil {
 		return nil, err
 	}
 
@@ -211,6 +211,28 @@ func (s *Service) restoreFile(dest string, f store.FileEntry) error {
 	mt := time.Unix(0, f.MtimeNs)
 	_ = os.Chtimes(dest, mt, mt)
 	return nil
+}
+
+// ensureRealDir validates the restore root itself before anything is
+// created or written. MkdirAll follows existing symlinks, so without this
+// check a target_dir that is a symlink to somewhere outside the allowed
+// root would silently redirect every restored file there.
+func ensureRealDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	switch {
+	case err == nil:
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("target_dir %s is a symlink; refusing to restore through it", dir)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("target_dir %s exists and is not a directory", dir)
+		}
+		return nil
+	case os.IsNotExist(err):
+		return os.MkdirAll(dir, 0o755)
+	default:
+		return err
+	}
 }
 
 // checkAncestors makes sure every directory between root and dest is a real
