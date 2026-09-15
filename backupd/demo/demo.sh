@@ -108,7 +108,30 @@ say "强制恢复（allow_incomplete）：缺块的文件逐个报 failed，而�
 post /v1/restore "{\"snapshot_id\": 4, \"target_dir\": \"$DEMO/restore-failed\", \"allow_incomplete\": true}" \
   | jq '{status, restored, failed, sample_failures: [.entries[] | select(.status=="failed")] | .[0:3]}'
 
-say "全部快照一览"
+say "保留策略：dry-run 预览（保留最近 1 个 complete 快照），不得修改任何数据"
+SNAPS_BEFORE=$(curl -sS "$BASE/v1/snapshots" | jq length)
+CHUNKS_BEFORE=$(find "$DATA/chunks" -type f -not -name '.tmp-*' | wc -l)
+post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1, \"dry_run\": true}" \
+  | jq '{dry_run, applied, delete_snapshots, kept: [.kept_snapshots[] | {id,status}], reclaim_chunks, reclaim_bytes}'
+test "$(curl -sS "$BASE/v1/snapshots" | jq length)" = "$SNAPS_BEFORE" && echo "DRYRUN_OK: 快照清单未变"
+test "$(find "$DATA/chunks" -type f -not -name '.tmp-*' | wc -l)" = "$CHUNKS_BEFORE" && echo "DRYRUN_OK: 块目录未变"
+
+say "应用保留策略：删除旧 complete 快照，仅回收零引用块（共享块保留）"
+post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1}" \
+  | jq '{applied, delete_snapshots, reclaim_chunks, reclaim_bytes, warnings}'
+echo "块目录：$CHUNKS_BEFORE -> $(find "$DATA/chunks" -type f -not -name '.tmp-*' | wc -l) 块"
+curl -sS "$BASE/v1/snapshots" | jq '.[] | {id,status}'
+
+say "删除后：保留的快照 2 仍可完整恢复（共享块与空文件不受影响）"
+post /v1/restore "{\"snapshot_id\": 2, \"target_dir\": \"$DEMO/restore-after-retention\"}" | jq '{status, restored, failed}'
+diff -r --no-dereference --exclude=active.log --exclude=late.bin --exclude=escape-hatch "$SRC" "$DEMO/restore-after-retention" \
+  && echo "RETENTION_OK: 保留快照恢复内容一致"
+test -f "$DEMO/restore-after-retention/empty.txt" && echo "RETENTION_OK: 空文件恢复正常"
+
+say "再次执行同一策略：删除集为空、回收为零，结果稳定"
+post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1}" | jq '{delete_snapshots, reclaim_chunks, reclaim_bytes}'
+
+say "全部快照一览（保留策略执行后）"
 curl -sS "$BASE/v1/snapshots" | jq '.[] | {id,status,chunks_added,chunks_reused,missing_chunks,unstable_files}'
 
 say "演示完成"

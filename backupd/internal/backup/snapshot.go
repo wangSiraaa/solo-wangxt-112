@@ -66,12 +66,9 @@ func (s *Service) CreateSnapshot(req SnapshotRequest) (*store.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	root, err := filepath.Abs(req.SourceRoot)
+	root, err := normalizeRoot(req.SourceRoot)
 	if err != nil {
 		return nil, fmt.Errorf("bad source_root: %w", err)
-	}
-	if resolved, err := filepath.EvalSymlinks(root); err == nil {
-		root = resolved
 	}
 	fi, err := os.Stat(root)
 	if err != nil {

@@ -27,6 +27,7 @@ func New(svc *backup.Service, db *store.DB) *Server {
 	mux.HandleFunc("GET /v1/snapshots/{id}/files", s.listFiles)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.listMissing)
 	mux.HandleFunc("POST /v1/restore", s.restore)
+	mux.HandleFunc("POST /v1/retention", s.retention)
 	s.mux = mux
 	return s
 }
@@ -143,6 +144,20 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	rep, err := s.svc.Restore(req)
 	if err != nil {
 		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
+	var req backup.RetentionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	rep, err := s.svc.Retention(req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, rep)

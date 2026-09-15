@@ -83,6 +83,19 @@ func (s *Store) Put(sha string, data []byte) error {
 	return nil
 }
 
+// Remove deletes a chunk from the store. A missing chunk is not an error:
+// retention may race with chunks that were registered but never uploaded.
+func (s *Store) Remove(sha string) error {
+	p, err := s.pathFor(sha)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) Get(sha string) ([]byte, error) {
 	p, err := s.pathFor(sha)
 	if err != nil {

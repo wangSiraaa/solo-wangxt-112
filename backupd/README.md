@@ -35,6 +35,16 @@ go build -o bin/backupd ./cmd/backupd
 | GET | `/v1/snapshots/{id}/files` | 清单（路径/类型/权限/长度/摘要/状态） |
 | GET | `/v1/snapshots/{id}/missing` | **缺块清单：文件 + 块哈希 + 原因** |
 | POST | `/v1/restore` | `{snapshot_id, target_dir, allow_incomplete?}` 恢复 |
+| POST | `/v1/retention` | `{source_root, keep_last_complete, dry_run?}` 保留策略预览/应用 |
+
+## 保留策略（retention）
+
+按 `source_root` 执行「保留最近 N 个 `complete` 快照」：
+
+- **预览**：`dry_run: true` 只读计算，返回将删除的快照、保留的快照（含 `failed`/`incomplete` 及其保留原因）、待回收块数与字节数，不修改任何数据。
+- **应用**：`dry_run` 缺省/false 时执行。先在**单个 SQLite 事务**内删除目标快照的全部清单行，并在同事务内基于仍保留快照的 `file_chunks` 引用清掉零引用块注册行；**提交之后**才从块目录删除这些零引用块。共享块被任一保留快照引用即安全；空文件无块，天然不受影响。
+- **失败语义**：清单事务失败则整体回滚，无任何变化；块文件删除失败只留无害孤儿文件（记入报告 `warnings`），绝不会出现清单已删却仍引用已删数据的半状态。
+- **可重复执行**：同一策略再次应用返回空删除集与零回收；`failed`/`incomplete`/`running` 快照永远不在删除范围内。
 
 ## 快照状态机
 
@@ -59,5 +69,6 @@ go build -o bin/backupd ./cmd/backupd
 ```
 
 覆盖：基线快照 → 小改动复用旧块（22 块只新增 1 块）→ 空文件 → 扫描中写入的文件标 `unstable` →
-`fault_after_chunks=3` 模拟提交中断得到 `failed` 快照与 20 条具体缺块 → 恢复到新目录并
-`diff -r` 独立核对 → 重复恢复全部 `skipped_exists` → 失败快照拒绝/强制恢复。
+`fault_after_chunks=3` 模拟提交中断得到 `failed` 快照与具体缺块清单 → 恢复到新目录并
+`diff -r` 独立核对 → 重复恢复全部 `skipped_exists` → 符号链接目标根被拒 → 失败快照拒绝/强制恢复 →
+保留策略 dry-run 预览（零副作用）→ 应用后旧 `complete` 快照删除、零引用块回收、保留快照仍可恢复 → 再次执行结果稳定。

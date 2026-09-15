@@ -5,6 +5,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -261,9 +262,20 @@ func (db *DB) GetSnapshot(id int64) (*Snapshot, error) {
 }
 
 func (db *DB) ListSnapshots() ([]Snapshot, error) {
-	rows, err := db.sql.Query(`SELECT id, source_root, started_at, finished_at, status, error,
+	return db.querySnapshots(`SELECT id, source_root, started_at, finished_at, status, error,
 		file_count, dir_count, symlink_count, total_bytes, chunks_added, chunks_reused,
 		unstable_files, missing_chunks FROM snapshots ORDER BY id`)
+}
+
+// SnapshotsForRoot lists snapshots of one source root, oldest first.
+func (db *DB) SnapshotsForRoot(root string) ([]Snapshot, error) {
+	return db.querySnapshots(`SELECT id, source_root, started_at, finished_at, status, error,
+		file_count, dir_count, symlink_count, total_bytes, chunks_added, chunks_reused,
+		unstable_files, missing_chunks FROM snapshots WHERE source_root = ? ORDER BY id`, root)
+}
+
+func (db *DB) querySnapshots(q string, args ...any) ([]Snapshot, error) {
+	rows, err := db.sql.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -277,6 +289,117 @@ func (db *DB) ListSnapshots() ([]Snapshot, error) {
 			return nil, err
 		}
 		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// CountChunks returns the number of chunk-registry rows.
+func (db *DB) CountChunks() (int64, error) {
+	var n int64
+	err := db.sql.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&n)
+	return n, err
+}
+
+// ReclaimedChunk is a chunk that became unreferenced after a retention run.
+type ReclaimedChunk struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func idsToArgs(ids []int64) []any {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
+}
+
+// ReclaimableChunks is the read-only preview of DeleteSnapshots: registry
+// chunks not referenced by any snapshot outside excludeIDs (this also covers
+// registry rows that nothing references, e.g. chunks of torn reads).
+func (db *DB) ReclaimableChunks(excludeIDs []int64) ([]ReclaimedChunk, error) {
+	if len(excludeIDs) == 0 {
+		return nil, nil
+	}
+	q := `SELECT sha256, size FROM chunks c WHERE NOT EXISTS (
+		SELECT 1 FROM file_chunks fc JOIN files f ON f.id = fc.file_id
+		WHERE fc.chunk_sha256 = c.sha256
+		  AND f.snapshot_id NOT IN (` + placeholders(len(excludeIDs)) + `)) ORDER BY sha256`
+	rows, err := db.sql.Query(q, idsToArgs(excludeIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanReclaimed(rows)
+}
+
+// DeleteSnapshots removes every manifest row of the given snapshots in a
+// single transaction, then — inside the same transaction — computes the
+// chunk-registry rows left with zero references from the remaining
+// file_chunks and removes them from the registry. The returned list is what
+// the caller may delete from the chunk directory after commit; a failure
+// there leaves harmless orphan files, never an inconsistent manifest.
+func (db *DB) DeleteSnapshots(ids []int64) ([]ReclaimedChunk, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	ph := placeholders(len(ids))
+	args := idsToArgs(ids)
+	stmts := []string{
+		`DELETE FROM file_chunks WHERE file_id IN (SELECT id FROM files WHERE snapshot_id IN (` + ph + `))`,
+		`DELETE FROM files WHERE snapshot_id IN (` + ph + `)`,
+		`DELETE FROM missing_chunks WHERE snapshot_id IN (` + ph + `)`,
+		`DELETE FROM snapshots WHERE id IN (` + ph + `)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(q, args...); err != nil {
+			return nil, err
+		}
+	}
+
+	rows, err := tx.Query(`SELECT sha256, size FROM chunks c
+		WHERE NOT EXISTS (SELECT 1 FROM file_chunks fc WHERE fc.chunk_sha256 = c.sha256)
+		ORDER BY sha256`)
+	if err != nil {
+		return nil, err
+	}
+	orphans, err := scanReclaimed(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM chunks WHERE NOT EXISTS
+		(SELECT 1 FROM file_chunks fc WHERE fc.chunk_sha256 = chunks.sha256)`); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return orphans, nil
+}
+
+func scanReclaimed(rows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}) ([]ReclaimedChunk, error) {
+	var out []ReclaimedChunk
+	for rows.Next() {
+		var c ReclaimedChunk
+		if err := rows.Scan(&c.SHA256, &c.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
