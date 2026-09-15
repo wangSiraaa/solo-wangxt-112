@@ -34,8 +34,20 @@ go build -o bin/backupd ./cmd/backupd
 | GET | `/v1/snapshots/{id}` | 快照详情（状态、统计、缺块数） |
 | GET | `/v1/snapshots/{id}/files` | 清单（路径/类型/权限/长度/摘要/状态） |
 | GET | `/v1/snapshots/{id}/missing` | **缺块清单：文件 + 块哈希 + 原因** |
+| POST | `/v1/snapshots/{id}/repair` | `{repair_id, fault_after_chunks?}` 修复带缺块的 failed 快照 |
+| GET | `/v1/snapshots/{id}/repairs` | 该快照的修复尝试记录 |
+| GET | `/v1/snapshots/{id}/repairs/{repair_id}` | 单次修复尝试记录 |
 | POST | `/v1/restore` | `{snapshot_id, target_dir, allow_incomplete?}` 恢复 |
 | POST | `/v1/retention` | `{source_root, keep_last_complete, dry_run?}` 保留策略预览/应用 |
+
+## 修复（repair）
+
+对带缺块的 `failed` 快照按原 `source_root` 补齐缺失块（`complete`/`running`/`incomplete` 不可修复，语义不变）：
+
+1. **源树核对**：清单中每个条目逐一比对——普通文件的 size、mtime、整文件 SHA-256，符号链接目标，目录存在性。任何缺失/变化逐项报告（`problems`），快照、清单、缺块记录全部保持不变，绝不把新内容混入旧快照。
+2. **补齐缺块**：按同一固定分块参数重切源文件，产出的块序列必须与清单完全一致（第二道防护）；只写入块存储中不存在的块——哈希/长度经 `Put` 校验，已有块复用，绝不覆盖，不写清单。
+3. **原子转正**：全部引用重新校验通过后，在**单个 SQLite 事务**内完成 `failed → complete`、清理 `missing_chunks`、记录尝试成功；事务失败整体回滚。
+4. **幂等与断点续修**：`repair_id` 为幂等键，尝试记录持久化于 `repair_attempts` 表。已成功的 `(snapshot_id, repair_id)` 重复请求直接回放结果（`replayed: true`），不重写清单；崩溃/中断留下的 `running` 记录在重启后用同一 `repair_id` 重试即可安全续跑（已写入的块按内容寻址天然幂等）。
 
 ## 保留策略（retention）
 
@@ -71,4 +83,6 @@ go build -o bin/backupd ./cmd/backupd
 覆盖：基线快照 → 小改动复用旧块（22 块只新增 1 块）→ 空文件 → 扫描中写入的文件标 `unstable` →
 `fault_after_chunks=3` 模拟提交中断得到 `failed` 快照与具体缺块清单 → 恢复到新目录并
 `diff -r` 独立核对 → 重复恢复全部 `skipped_exists` → 符号链接目标根被拒 → 失败快照拒绝/强制恢复 →
-保留策略 dry-run 预览（零副作用）→ 应用后旧 `complete` 快照删除、零引用块回收、保留快照仍可恢复 → 再次执行结果稳定。
+保留策略 dry-run 预览（零副作用）→ 应用后旧 `complete` 快照删除、零引用块回收、保留快照仍可恢复 → 再次执行结果稳定 →
+修复中途崩溃 + 重启后同一 `repair_id` 续修成功、快照原子转 `complete`、幂等回放 → 修复后完整恢复 →
+源文件被改写/删除时修复逐项报告且数据库不变。

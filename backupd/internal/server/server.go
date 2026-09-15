@@ -26,6 +26,9 @@ func New(svc *backup.Service, db *store.DB) *Server {
 	mux.HandleFunc("GET /v1/snapshots/{id}", s.getSnapshot)
 	mux.HandleFunc("GET /v1/snapshots/{id}/files", s.listFiles)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.listMissing)
+	mux.HandleFunc("POST /v1/snapshots/{id}/repair", s.repairSnapshot)
+	mux.HandleFunc("GET /v1/snapshots/{id}/repairs", s.listRepairs)
+	mux.HandleFunc("GET /v1/snapshots/{id}/repairs/{repair_id}", s.getRepair)
 	mux.HandleFunc("POST /v1/restore", s.restore)
 	mux.HandleFunc("POST /v1/retention", s.retention)
 	s.mux = mux
@@ -147,6 +150,61 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rep)
+}
+
+func (s *Server) repairSnapshot(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	var req backup.RepairRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	rep, err := s.svc.Repair(id, req)
+	if err != nil {
+		if errors.Is(err, backup.ErrSimulatedCrash) {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (s *Server) listRepairs(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	attempts, err := s.db.ListRepairAttempts(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, attempts)
+}
+
+func (s *Server) getRepair(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	attempt, err := s.db.GetRepairAttempt(id, r.PathValue("repair_id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if attempt == nil {
+		writeErr(w, http.StatusNotFound, errors.New("repair attempt not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, attempt)
 }
 
 func (s *Server) retention(w http.ResponseWriter, r *http.Request) {

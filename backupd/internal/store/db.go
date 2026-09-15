@@ -26,6 +26,13 @@ const (
 	FileEscaped  = "escaped"  // symlink whose target leaves the source root
 )
 
+// Repair attempt states.
+const (
+	RepairRunning   = "running"
+	RepairSucceeded = "succeeded"
+	RepairFailed    = "failed"
+)
+
 type Snapshot struct {
 	ID            int64  `json:"id"`
 	SourceRoot    string `json:"source_root"`
@@ -143,6 +150,20 @@ CREATE TABLE IF NOT EXISTS missing_chunks (
   reason      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_missing_snap ON missing_chunks(snapshot_id);
+CREATE TABLE IF NOT EXISTS repair_attempts (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  repair_id       TEXT NOT NULL,
+  snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id),
+  started_at      TEXT NOT NULL,
+  finished_at     TEXT NOT NULL DEFAULT '',
+  status          TEXT NOT NULL,
+  error           TEXT NOT NULL DEFAULT '',
+  attempts        INTEGER NOT NULL DEFAULT 1,
+  chunks_supplied INTEGER NOT NULL DEFAULT 0,
+  bytes_supplied  INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (snapshot_id, repair_id)
+);
+CREATE INDEX IF NOT EXISTS idx_repair_snap ON repair_attempts(snapshot_id);
 `)
 	return err
 }
@@ -400,6 +421,116 @@ func scanReclaimed(rows interface {
 			return nil, err
 		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// RepairAttempt is the persisted, idempotent record of one logical repair
+// operation (keyed by snapshot_id + repair_id).
+type RepairAttempt struct {
+	ID             int64  `json:"id"`
+	RepairID       string `json:"repair_id"`
+	SnapshotID     int64  `json:"snapshot_id"`
+	StartedAt      string `json:"started_at"`
+	FinishedAt     string `json:"finished_at,omitempty"`
+	Status         string `json:"status"` // running | succeeded | failed
+	Error          string `json:"error,omitempty"`
+	Attempts       int64  `json:"attempts"`
+	ChunksSupplied int64  `json:"chunks_supplied"`
+	BytesSupplied  int64  `json:"bytes_supplied"`
+}
+
+// BeginRepairAttempt registers a new attempt or re-arms an interrupted/failed one
+// (same snapshot+repair_id): the row goes back to running and the execution
+// counter increases. A succeeded row is never reset here — callers check it
+// first and replay instead.
+func (db *DB) BeginRepairAttempt(snapshotID int64, repairID string) (int64, error) {
+	if _, err := db.sql.Exec(`INSERT INTO repair_attempts (repair_id, snapshot_id, started_at, status, attempts)
+		VALUES (?,?,?,?,1)
+		ON CONFLICT (snapshot_id, repair_id) DO UPDATE SET
+			started_at=excluded.started_at, finished_at='', status=?, error='',
+			chunks_supplied=0, bytes_supplied=0,
+			attempts=repair_attempts.attempts+1`,
+		repairID, snapshotID, now(), RepairRunning, RepairRunning); err != nil {
+		return 0, err
+	}
+	var id int64
+	err := db.sql.QueryRow(`SELECT id FROM repair_attempts WHERE snapshot_id=? AND repair_id=?`,
+		snapshotID, repairID).Scan(&id)
+	return id, err
+}
+
+// FinishRepairAttempt records the outcome of a failed attempt. Success goes
+// through CompleteRepairAndSnapshot so the snapshot transition and the
+// attempt record commit atomically.
+func (db *DB) FinishRepairAttempt(id int64, status, errMsg string, chunks, bytes int64) error {
+	_, err := db.sql.Exec(`UPDATE repair_attempts SET status=?, finished_at=?, error=?,
+		chunks_supplied=?, bytes_supplied=? WHERE id=?`,
+		status, now(), errMsg, chunks, bytes, id)
+	return err
+}
+
+// CompleteRepairAndSnapshot atomically, in one transaction: flips the
+// snapshot failed->complete (guarded on its current state), clears its
+// missing_chunks and marks the repair attempt succeeded.
+func (db *DB) CompleteRepairAndSnapshot(attemptID, snapshotID int64, chunks, bytes int64) error {
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`UPDATE snapshots SET status=?, error='', finished_at=?, missing_chunks=0
+		WHERE id=? AND status=?`, StatusComplete, now(), snapshotID, StatusFailed)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("snapshot %d no longer in failed state; repair not committed", snapshotID)
+	}
+	if _, err := tx.Exec(`DELETE FROM missing_chunks WHERE snapshot_id=?`, snapshotID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE repair_attempts SET status=?, finished_at=?, error='',
+		chunks_supplied=?, bytes_supplied=? WHERE id=?`,
+		RepairSucceeded, now(), chunks, bytes, attemptID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (db *DB) GetRepairAttempt(snapshotID int64, repairID string) (*RepairAttempt, error) {
+	row := db.sql.QueryRow(`SELECT id, repair_id, snapshot_id, started_at, finished_at, status,
+		error, attempts, chunks_supplied, bytes_supplied
+		FROM repair_attempts WHERE snapshot_id=? AND repair_id=?`, snapshotID, repairID)
+	var a RepairAttempt
+	err := row.Scan(&a.ID, &a.RepairID, &a.SnapshotID, &a.StartedAt, &a.FinishedAt,
+		&a.Status, &a.Error, &a.Attempts, &a.ChunksSupplied, &a.BytesSupplied)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (db *DB) ListRepairAttempts(snapshotID int64) ([]RepairAttempt, error) {
+	rows, err := db.sql.Query(`SELECT id, repair_id, snapshot_id, started_at, finished_at, status,
+		error, attempts, chunks_supplied, bytes_supplied
+		FROM repair_attempts WHERE snapshot_id=? ORDER BY id`, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RepairAttempt{}
+	for rows.Next() {
+		var a RepairAttempt
+		if err := rows.Scan(&a.ID, &a.RepairID, &a.SnapshotID, &a.StartedAt, &a.FinishedAt,
+			&a.Status, &a.Error, &a.Attempts, &a.ChunksSupplied, &a.BytesSupplied); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
 	}
 	return out, rows.Err()
 }

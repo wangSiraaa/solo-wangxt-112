@@ -92,22 +92,14 @@ func (s *Service) CreateSnapshot(req SnapshotRequest) (*store.Snapshot, error) {
 
 	// Pre-commit gate: every chunk the manifest references must verify
 	// against the store, no matter how the scan ended.
-	missing := 0
-	refs, err := s.db.SnapshotChunkRefs(snapID)
+	missingRefs, err := s.missingChunkRefs(snapID)
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
-	for _, r := range refs {
-		if seen[r.SHA256] { // same chunk referenced by many files: check once
-			continue
-		}
-		seen[r.SHA256] = true
-		if _, err := s.cs.Verify(r.SHA256); err != nil {
-			missing++
-			_ = s.db.InsertMissingChunk(snapID, r.FilePath, r.SHA256, err.Error())
-		}
+	for _, m := range missingRefs {
+		_ = s.db.InsertMissingChunk(snapID, m.FilePath, m.ChunkSHA, m.Reason)
 	}
+	missing := len(missingRefs)
 
 	snap := store.Snapshot{
 		ID:            snapID,
@@ -137,6 +129,31 @@ func (s *Service) CreateSnapshot(req SnapshotRequest) (*store.Snapshot, error) {
 		return nil, err
 	}
 	return s.db.GetSnapshot(snapID)
+}
+
+// missingChunkRefs returns the distinct chunk hashes referenced by the
+// snapshot that fail store verification, each with one referencing file.
+// It is the shared gate used by snapshot commit and by repair.
+func (s *Service) missingChunkRefs(snapshotID int64) ([]store.MissingChunk, error) {
+	refs, err := s.db.SnapshotChunkRefs(snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []store.MissingChunk
+	for _, r := range refs {
+		if seen[r.SHA256] { // same chunk referenced by many files: check once
+			continue
+		}
+		seen[r.SHA256] = true
+		if _, err := s.cs.Verify(r.SHA256); err != nil {
+			out = append(out, store.MissingChunk{
+				SnapshotID: snapshotID, FilePath: r.FilePath,
+				ChunkSHA: r.SHA256, Reason: err.Error(),
+			})
+		}
+	}
+	return out, nil
 }
 
 // faultState simulates chunk uploads lost to an interrupted commit.

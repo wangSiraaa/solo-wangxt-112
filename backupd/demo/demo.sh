@@ -131,7 +131,42 @@ test -f "$DEMO/restore-after-retention/empty.txt" && echo "RETENTION_OK: 空文�
 say "再次执行同一策略：删除集为空、回收为零，结果稳定"
 post /v1/retention "{\"source_root\": \"$SRC\", \"keep_last_complete\": 1}" | jq '{delete_snapshots, reclaim_chunks, reclaim_bytes}'
 
-say "全部快照一览（保留策略执行后）"
+say "修复流程：对 failed 快照 4 发起修复，模拟修复中途崩溃（fault_after_chunks=2）"
+post "/v1/snapshots/4/repair" '{"repair_id": "repair-0001", "fault_after_chunks": 2}' | jq . || true
+
+say "重启服务（模拟进程中断），持久化的尝试记录仍在"
+kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true
+"$BIN" -addr "$ADDR" -data "$DATA" -enable-fault-injection >> "$DEMO/server.log" 2>&1 &
+SRV=$!
+for i in $(seq 1 50); do curl -sf "$BASE/v1/healthz" > /dev/null && break || sleep 0.1; done
+curl -sS "$BASE/v1/snapshots/4/repairs" | jq '.[] | {repair_id, status, attempts}'
+curl -sS "$BASE/v1/snapshots/4/repairs/repair-0001" | jq '{repair_id, status, attempts}'
+
+say "同一 repair_id 重试：安全续跑，最终成功，快照原子转为 complete"
+post "/v1/snapshots/4/repair" '{"repair_id": "repair-0001"}' \
+  | jq '{status, snapshot_status, attempts, chunks_supplied, bytes_supplied, verified_files}'
+curl -sS "$BASE/v1/snapshots/4" | jq '{id, status, missing_chunks, error}'
+test "$(curl -sS "$BASE/v1/snapshots/4/missing" | jq length)" = "0" && echo "REPAIR_OK: 缺块记录已清理"
+
+say "相同 repair_id 重复请求：幂等回放，不重写清单"
+post "/v1/snapshots/4/repair" '{"repair_id": "repair-0001"}' | jq '{status, replayed, attempts}'
+
+say "修复后的快照 4 可完整恢复（late.bin 逐字节一致）"
+post /v1/restore "{\"snapshot_id\": 4, \"target_dir\": \"$DEMO/restore-repaired\"}" | jq '{status, restored, failed}'
+cmp "$SRC/late.bin" "$DEMO/restore-repaired/late.bin" && echo "REPAIR_OK: late.bin 内容一致"
+
+say "源文件被改写/删除后：修复逐项报告并保持数据库不变"
+head -c 300000 /dev/urandom > "$SRC/newfile.bin"
+SNAP5=$(post /v1/snapshots "{\"source_root\": \"$SRC\", \"fault_after_chunks\": 2}" | jq -r .id)
+echo "  新失败快照 id=$SNAP5（missing=$(curl -sS "$BASE/v1/snapshots/$SNAP5" | jq -r .missing_chunks)）"
+echo "tampered after snapshot" >> "$SRC/newfile.bin"
+rm "$SRC/docs/metrics.txt"
+MISS_BEFORE=$(curl -sS "$BASE/v1/snapshots/$SNAP5/missing" | jq length)
+post "/v1/snapshots/$SNAP5/repair" '{"repair_id": "repair-0002"}' | jq '{status, problems}'
+test "$(curl -sS "$BASE/v1/snapshots/$SNAP5" | jq -r .status)" = "failed" && echo "REPAIR_OK: 源文件变化时快照保持 failed"
+test "$(curl -sS "$BASE/v1/snapshots/$SNAP5/missing" | jq length)" = "$MISS_BEFORE" && echo "REPAIR_OK: 缺块记录未被改动"
+
+say "全部快照一览（保留策略与修复之后）"
 curl -sS "$BASE/v1/snapshots" | jq '.[] | {id,status,chunks_added,chunks_reused,missing_chunks,unstable_files}'
 
 say "演示完成"
